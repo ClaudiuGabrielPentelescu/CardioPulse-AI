@@ -1,0 +1,16 @@
+
+{
+    "fps": 30,
+    "gamma": {
+        "low_light": 1.8,
+        "medium_light": 1.4,
+        "high_light": 0.8
+    },
+    "bpm_thresholds": {
+        "relax": 80,
+        "moderate": 120
+    },
+    "roi": {
+        "height_fraction": 0.3
+    }
+}

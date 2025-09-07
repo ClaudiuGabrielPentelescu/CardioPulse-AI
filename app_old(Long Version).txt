@@ -1,0 +1,1141 @@
+import cv2
+import numpy as np
+import time
+from scipy.fft import fft, fftfreq
+from scipy.signal import savgol_filter, butter, filtfilt, find_peaks
+import tkinter as tk
+from tkinter import ttk, messagebox
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import threading
+from PIL import Image, ImageTk
+import dlib
+from fpdf import FPDF
+
+# ---------------------------------------------------------
+# Culori principale
+# ---------------------------------------------------------
+# Background old uniform crem: "#E8D5B7"
+# Background uniform crem: "#fff8e1"
+
+BG_COLOR = "#fff8e1"
+BUTTON_BG = "#8B4513"   # SaddleBrown
+BUTTON_FG = "#FFF5E1"   # Crem alb-gălbui
+
+# ---------------------------------------------------------
+# Funcții de procesare EVM/PPG
+# ---------------------------------------------------------
+
+
+def build_gaussian_pyramid(frame, levels):
+    """
+    Construiește o piramidă Gaussiană pentru un frame.
+    """
+    pyramid = [frame.astype(np.float32)]
+    current_frame = frame.astype(np.float32)
+    for _ in range(levels - 1):
+        if current_frame.shape[0] <= 4 or current_frame.shape[1] <= 4:
+            break
+        current_frame = cv2.pyrDown(current_frame)
+        pyramid.append(current_frame)
+    return pyramid
+
+
+def temporal_bandpass_filter(data_sequence, fps, low_freq, high_freq, order=2):
+    """
+    Aplică un filtru Butterworth trece-bandă pe o secvență temporală.
+    """
+    if not isinstance(data_sequence, np.ndarray) or data_sequence.ndim == 0 or data_sequence.shape[0] == 0:
+        return data_sequence
+
+    nyquist = 0.5 * fps
+    low = max(0.01 / nyquist, min(low_freq / nyquist, 0.99))
+    high = max(0.01 / nyquist, min(high_freq / nyquist, 0.99))
+
+    if low >= high:
+        return data_sequence
+
+    min_len_for_filtfilt = 3 * (order + 1)
+    if data_sequence.shape[0] <= min_len_for_filtfilt:
+        return data_sequence
+
+    try:
+        b, a = butter(order, [low, high], btype='band',
+                      analog=False, output='ba')
+        padlen_val = min(min_len_for_filtfilt - 1,
+                         data_sequence.shape[0] - 1) if data_sequence.shape[0] > 1 else 0
+        if data_sequence.shape[0] <= padlen_val:
+            return data_sequence
+        return filtfilt(b, a, data_sequence, axis=0, padtype='odd', padlen=padlen_val)
+    except ValueError:
+        return data_sequence
+
+
+def eulerian_magnification(roi_buffer, fps, low_freq_evm, high_freq_evm, amplification_factor, pyramid_levels=3):
+    """
+    Aplică magnificare Euleriană pe un buffer de ROI-uri (frunte).
+    """
+    # Dacă nu am buffer suficient, întoarcem ultimul ROI nemodificat
+    if not roi_buffer or len(roi_buffer) < 2 * (fps / low_freq_evm):
+        return None if not roi_buffer else roi_buffer[-1]
+
+    float_rois = [roi.astype(np.float32) for roi in roi_buffer]
+    original_shape_evm_roi = float_rois[0].shape
+
+    spatial_level_sequence = []
+    target_pyramid_level_index = min(pyramid_levels - 1, 1)
+
+    for roi_frame in float_rois:
+        current_pyramid = build_gaussian_pyramid(roi_frame, pyramid_levels)
+        actual_level_to_use = min(
+            target_pyramid_level_index, len(current_pyramid) - 1)
+        spatial_level_sequence.append(current_pyramid[actual_level_to_use])
+
+    if not spatial_level_sequence:
+        return float_rois[-1]
+
+    temporal_data = np.array(spatial_level_sequence)
+    filtered_temporal_data = np.zeros_like(temporal_data, dtype=np.float32)
+
+    if temporal_data.size > 0 and fps > 0.1:
+        for c in range(temporal_data.shape[3]):
+            channel_data = temporal_data[:, :, :, c]
+            filtered_channel_data = temporal_bandpass_filter(
+                channel_data, fps, low_freq_evm, high_freq_evm, order=2
+            )
+            if filtered_channel_data.shape == channel_data.shape:
+                filtered_temporal_data[:, :, :, c] = filtered_channel_data
+            else:
+                filtered_temporal_data[:, :, :, c] = channel_data
+    else:
+        filtered_temporal_data = temporal_data
+
+    magnified_component_at_level = filtered_temporal_data[-1] * \
+        amplification_factor
+    base_frame_at_level = spatial_level_sequence[-1]
+    magnified_level_roi = base_frame_at_level + \
+        magnified_component_at_level.astype(base_frame_at_level.dtype)
+
+    final_magnified_roi = magnified_level_roi
+    if (magnified_level_roi.shape[0] != original_shape_evm_roi[0] or
+            magnified_level_roi.shape[1] != original_shape_evm_roi[1]):
+        final_magnified_roi = cv2.resize(
+            magnified_level_roi,
+            (original_shape_evm_roi[1], original_shape_evm_roi[0]),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+    final_magnified_roi = np.clip(final_magnified_roi, 0, 255)
+    return final_magnified_roi.astype(np.uint8)
+
+
+# ---------------------------------------------------------
+# Clasa principală a aplicației
+# ---------------------------------------------------------
+
+class PulseMonitorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Monitor Puls Cardiac")
+        self.root.geometry("800x760")
+        self.root.resizable(False, False)
+
+        # Setăm fundalul uniform peste tot
+        self.root.configure(bg=BG_COLOR)
+
+        # Stiluri comune pentru butoane
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("My.TButton",
+                        background=BUTTON_BG,
+                        foreground=BUTTON_FG,
+                        font=("Arial", 10, "bold"),
+                        borderwidth=0,
+                        focusthickness=3,
+                        focuscolor=BUTTON_BG)
+        style.map("My.TButton",
+                  background=[("active", "#A0522D")],
+                  foreground=[("active", BUTTON_FG)])
+
+        # -------------------------------------------------
+        # 1) Canvas video în partea de sus
+        # -------------------------------------------------
+        self.video_frame = tk.Frame(
+            self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        self.video_frame.place(x=80, y=20, width=640, height=480)
+
+        self.canvas = tk.Canvas(
+            self.video_frame, width=640, height=480, bg="black", bd=0, highlightthickness=0
+        )
+        self.canvas.pack()
+
+        # -------------------------------------------------
+        # 2) Butoane principale (Start, Salvează, Feedback, Grafic)
+        # -------------------------------------------------
+        self.button_frame = tk.Frame(
+            self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        self.button_frame.place(x=0, y=520, width=800, height=50)
+
+        self.start_stop_button = ttk.Button(
+            self.button_frame, text="Start Măsurare", style="My.TButton", command=self.toggle_measurement
+        )
+        self.start_stop_button.place(x=50, y=5, width=150, height=40)
+
+        self.save_button = ttk.Button(
+            self.button_frame, text="Salvează Ritmul", style="My.TButton",
+            command=self.save_pulse, state=tk.DISABLED
+        )
+        self.save_button.place(x=225, y=5, width=150, height=40)
+
+        self.feedback_button = ttk.Button(
+            self.button_frame, text="Feedback Măsurare", style="My.TButton",
+            command=self.show_feedback, state=tk.DISABLED
+        )
+        self.feedback_button.place(x=400, y=5, width=150, height=40)
+
+        self.graph_button = ttk.Button(
+            self.button_frame, text="Grafic Evoluție", style="My.TButton",
+            command=self.show_graph, state=tk.DISABLED
+        )
+        self.graph_button.place(x=575, y=5, width=150, height=40)
+
+        # -------------------------------------------------
+        # 3) Butoane de setări (Balans Alb Auto și EVM)
+        # -------------------------------------------------
+        self.control_frame = tk.Frame(
+            self.root, bg=BG_COLOR, bd=0, highlightthickness=0)
+        self.control_frame.place(x=0, y=570, width=800, height=50)
+
+        self.white_balance_button = ttk.Button(
+            self.control_frame,
+            text=f"Balans Alb Auto: {'Activat' if True else 'Dezactivat'}",
+            style="My.TButton",
+            command=self.toggle_white_balance
+        )
+        self.white_balance_button.place(x=200, y=5, width=200, height=40)
+
+        self.evm_toggle_button = ttk.Button(
+            self.control_frame,
+            text=f"EVM: {'Activat' if True else 'Dezactivat'}",
+            style="My.TButton",
+            command=self.toggle_evm
+        )
+        self.evm_toggle_button.place(x=425, y=5, width=150, height=40)
+
+        # -------------------------------------------------
+        # 4) Etichetele de stare (Puls, Stare, FPS, Instrucțiuni)
+        # -------------------------------------------------
+        labels_frame = tk.Frame(self.root,
+                                bg=BG_COLOR,  # aceeași culoare crem uniformă
+                                bd=0,
+                                highlightthickness=0)
+        # Plasăm labels_frame la y=620
+        labels_frame.place(x=0, y=620, width=800, height=140)
+
+        # Etichete centrate orizontal
+        self.pulse_label = tk.Label(
+            labels_frame,
+            text="Puls: N/A",
+            font=("Arial", 20, "bold"),
+            bg=BG_COLOR
+        )
+        self.pulse_label.pack(pady=(5, 2))
+
+        self.pulse_status_label = tk.Label(
+            labels_frame,
+            text="Stare: -",
+            font=("Arial", 14),
+            bg=BG_COLOR
+        )
+        self.pulse_status_label.pack(pady=(2, 2))
+
+        self.fps_label = tk.Label(
+            labels_frame,
+            text="FPS: 0.00",
+            font=("Arial", 10),
+            bg=BG_COLOR
+        )
+        self.fps_label.pack(pady=(2, 2))
+
+        self.instruction_label = tk.Label(
+            labels_frame,
+            text="Așezați fața în cadru și apăsați Start.",
+            font=("Arial", 12),
+            bg=BG_COLOR
+        )
+        self.instruction_label.pack(pady=(2, 5))
+
+        # -------------------------------------------------
+        # 5) Inițializare variabile PPG/EVM și detecție
+        # -------------------------------------------------
+        self.graph_window = None
+        self.fig, self.ax = plt.subplots(figsize=(8, 4))
+        self.canvas_widget = None
+
+        self.is_measuring = False
+        self.stop_processing = threading.Event()
+        self.processing_thread = None
+        self.cap = None
+        self.photo = None
+        self.stable_pulse = None
+        self.measurement_time = 0
+
+        # Încarcare modele pentru detecția feței și a landmark-urilor
+        self.face_detector_type = "dnn"
+        self.dnn_prototxt_path = "deploy.prototxt"
+        self.dnn_caffe_model_path = "res10_300x300_ssd_iter_140000.caffemodel"
+        self.dlib_shape_predictor_path = "shape_predictor_68_face_landmarks.dat"
+        self.face_net = cv2.dnn.readNetFromCaffe(
+            self.dnn_prototxt_path, self.dnn_caffe_model_path)
+        self.landmark_predictor = dlib.shape_predictor(
+            self.dlib_shape_predictor_path)
+
+        # Parametri PPG
+        self.actual_fps = 0.0
+        self.frame_times = []
+        self.fps_buffer_size = 30
+        self.ppg_buffer_size = 300  # am majorat puțin pentru FFT mai bun
+        self.min_fft_len = 150
+
+        self.target_pulse_min_freq_bpm = 40
+        self.target_pulse_max_freq_bpm = 220
+        self.min_frequency_hz = self.target_pulse_min_freq_bpm / 60.0
+        self.max_frequency_hz = self.target_pulse_max_freq_bpm / 60.0
+
+        self.auto_white_balance = True
+        self.evm_enabled = True
+        self.evm_roi_buffer = []
+        self.evm_roi_buffer_size = 90
+
+        self.evm_amplification_factor = 70
+        self.evm_pyramid_levels = 3
+        self.evm_low_freq_hz = self.min_frequency_hz
+        self.evm_high_freq_hz = self.max_frequency_hz
+        self.target_evm_roi_w = 64
+        self.target_evm_roi_h = 48
+
+        self.min_forehead_roi_w = 30
+        self.min_forehead_roi_h = 20
+
+        # Am crescut pragul de stabilitate: 60 de măsurători consecvente
+        self.stability_check_min_pulses = 100
+        self.stability_std_threshold = 1.5  # mai strict față de 2.0
+
+        self.ppg_filter_order = 3
+        self.savgol_polyorder_ppg = 2
+
+        self.pulse_values = []
+        self.time_values = []
+        self.ppg_signal_history = []
+        self.detected_face = None
+        self.detected_landmarks_roi = None
+
+        # Ținem ultimul ROI valid pentru stabilitate spațială
+        self.last_forehead_roi = None
+        # Filtru pentru smooth la coordonate ROI
+        self.roi_smoothing_alpha = 0.3
+
+    # -------------------------------------------------
+    # Metodele de toggle (EVM / White balance)
+    # -------------------------------------------------
+    def toggle_measurement(self):
+        if not self.is_measuring:
+            self.start_measurement()
+        else:
+            self.stop_measurement()
+
+    def toggle_evm(self):
+        self.evm_enabled = not self.evm_enabled
+        self.evm_toggle_button.config(
+            text=f"EVM: {'Activat' if self.evm_enabled else 'Dezactivat'}")
+        msg = f"EVM {'Activat' if self.evm_enabled else 'Dezactivat'}."
+        if self.is_measuring:
+            self.stop_measurement()
+            self.instruction_label.config(
+                text=msg + " Apăsați Start pentru a reîncepe.")
+        else:
+            self.instruction_label.config(
+                text=msg + " Așezați fața în cadru.")
+
+    def toggle_white_balance(self):
+        self.auto_white_balance = not self.auto_white_balance
+        self.white_balance_button.config(
+            text=f"Balans Alb Auto: {'Activat' if self.auto_white_balance else 'Dezactivat'}")
+        if self.is_measuring:
+            self.stop_measurement()
+            self.instruction_label.config(
+                text="Setare Balans Alb aplicată. Apăsați Start pentru a reîncepe.")
+        else:
+            self.instruction_label.config(
+                text="Setare Balans Alb schimbată. Așezați fața în cadru.")
+
+    # -------------------------------------------------
+    # Metode de pornire/oprire măsurătorii
+    # -------------------------------------------------
+    def start_measurement(self):
+        if self.is_measuring:
+            return
+
+        cap_test = cv2.VideoCapture(0)
+        if not cap_test.isOpened():
+            messagebox.showerror(
+                "Eroare Cameră", "Nu se poate accesa camera web! Verificați conexiunea și permisiunile.")
+            cap_test.release()
+            return
+        cap_test.release()
+
+        # forțează backend DirectShow și buffer minim
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        if hasattr(cv2, "CAP_PROP_AUTOWB"):
+            self.cap.set(cv2.CAP_PROP_AUTOWB,
+                         1 if self.auto_white_balance else 0)
+
+        self.is_measuring = True
+        self.stop_processing.clear()
+        self.measurement_time = time.time()
+        self.start_stop_button.config(text="Stop Măsurare")
+        self.save_button.config(state=tk.DISABLED)
+        self.feedback_button.config(state=tk.DISABLED)
+        self.graph_button.config(state=tk.DISABLED)
+        self.pulse_label.config(text="Puls: Inițializare...")
+        self.pulse_status_label.config(text="Stare: -")
+        self.instruction_label.config(
+            text="Mențineți fața nemișcată. Colectare date...")
+
+        self.stable_pulse = None
+        self.pulse_values = []
+        self.time_values = []
+        self.ppg_signal_history = []
+        self.evm_roi_buffer = []
+        self.frame_times = []
+
+        # Resetăm ROI-ul anterior
+        self.last_forehead_roi = None
+
+        self.processing_thread = threading.Thread(
+            target=self.process_video, daemon=True)
+        self.processing_thread.start()
+
+    def stop_measurement(self):
+        if not self.is_measuring and not self.stop_processing.is_set():
+            if self.processing_thread is None or not self.processing_thread.is_alive():
+                return
+
+        self.is_measuring = False
+        self.stop_processing.set()
+
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=3)
+        self.processing_thread = None
+
+        self.start_stop_button.config(text="Start Măsurare")
+        self.instruction_label.config(
+            text="Măsurare oprită. Apăsați Start pentru a reîncepe.")
+        self.pulse_status_label.config(text="Stare: Oprit")
+
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            self.cap = None
+
+        # Afișăm ecran negru după oprire
+        self.root.after(0, self._display_blank_image,
+                        np.zeros((480, 640, 3), dtype=np.uint8))
+
+    # -------------------------------------------------
+    # Afișare frame video/negru
+    # -------------------------------------------------
+    def _display_blank_image(self, image_data):
+        try:
+            self.photo = self.convert_cv2_to_photo(image_data)
+            if self.canvas and self.canvas.winfo_exists():
+                self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+        except tk.TclError:
+            pass
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Calcul ROI frunte din dlib landmarks și smoothing spațial
+    # -------------------------------------------------
+    def get_forehead_roi_from_landmarks(self, landmarks, frame_shape):
+        try:
+            pts_left_eyebrow = np.array([(landmarks.part(i).x, landmarks.part(i).y)
+                                         for i in range(17, 22)])
+            pts_right_eyebrow = np.array([(landmarks.part(i).x, landmarks.part(i).y)
+                                          for i in range(22, 27)])
+            all_eyebrow_pts = np.concatenate(
+                (pts_left_eyebrow, pts_right_eyebrow))
+            min_y_eyebrow = np.min(all_eyebrow_pts[:, 1])
+            max_y_eyebrow = np.max(all_eyebrow_pts[:, 1])
+            min_x_eyebrow = np.min(pts_left_eyebrow[:, 0])
+            max_x_eyebrow = np.max(pts_right_eyebrow[:, 0])
+
+            eyebrow_height_approx = max_y_eyebrow - min_y_eyebrow
+            forehead_height = int(eyebrow_height_approx * 1.0)
+
+            roi_y_start = max(0, min_y_eyebrow - forehead_height -
+                              int(eyebrow_height_approx * 0.2))
+            roi_y_end = max(0, min_y_eyebrow -
+                            int(eyebrow_height_approx * 0.1))
+
+            forehead_width = max_x_eyebrow - min_x_eyebrow
+            roi_x_start = min_x_eyebrow + int(forehead_width * 0.15)
+            roi_x_end = max_x_eyebrow - int(forehead_width * 0.15)
+
+            # Dacă ROI-ul iese în contradicție, facem fallback la o zonă mai mică, centrată
+            if roi_y_start >= roi_y_end or roi_x_start >= roi_x_end:
+                center_x = (min_x_eyebrow + max_x_eyebrow) // 2
+                roi_x_start = center_x - int(forehead_width * 0.2)
+                roi_x_end = center_x + int(forehead_width * 0.2)
+                roi_y_start = max(0, min_y_eyebrow -
+                                  int(1.5 * eyebrow_height_approx))
+                roi_y_end = min_y_eyebrow
+
+            roi_x = max(0, roi_x_start)
+            roi_y = max(0, roi_y_start)
+            roi_w = min(frame_shape[1] - roi_x, roi_x_end - roi_x)
+            roi_h = min(frame_shape[0] - roi_y, roi_y_end - roi_y)
+
+            if roi_w > self.min_forehead_roi_w and roi_h > self.min_forehead_roi_h:
+                return (roi_x, roi_y, roi_w, roi_h)
+        except Exception:
+            return None
+        return None
+
+    # -------------------------------------------------
+    # Bucla principală de procesare video și extracție PPG
+    # -------------------------------------------------
+    def process_video(self):
+        if not self.cap or not self.cap.isOpened():
+            if not self.stop_processing.is_set():
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Eroare", "Nu se poate accesa camera web!"))
+            self.is_measuring = False
+            self.root.after(0, lambda: self.start_stop_button.config(
+                text="Start Măsurare"))
+            self.root.after(0, lambda: self.instruction_label.config(
+                text="Eroare cameră. Verificați și încercați din nou."))
+            return
+
+        dnn_input_size = (300, 300)
+        dnn_confidence_threshold = 0.6
+
+        while not self.stop_processing.is_set():
+            loop_start_time = time.time()
+            ret, frame = self.cap.read()
+            if not ret:
+                if not self.stop_processing.is_set():
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Eroare", "Eroare la citirea frame-ului video!"))
+                break
+
+            # Calcul FPS
+            current_frame_time = time.time()
+            self.frame_times.append(current_frame_time)
+            if len(self.frame_times) > self.fps_buffer_size:
+                self.frame_times.pop(0)
+
+            if len(self.frame_times) > 1:
+                time_diffs = np.diff(self.frame_times)
+                if np.sum(time_diffs) > 1e-6:
+                    self.actual_fps = len(time_diffs) / np.sum(time_diffs)
+                else:
+                    self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS) or 1.0
+            else:
+                self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS) or 1.0
+
+            effective_fps_for_calc = max(15.0, self.actual_fps)
+            # Afișăm FPS în UI
+            self.root.after(0, lambda: self.fps_label.config(
+                text=f"FPS: {self.actual_fps:.1f} ({'EVM' if self.evm_enabled else 'STD'})"))
+
+            display_frame = frame.copy()
+            processed_roi_for_signal_extraction = None
+            self.detected_landmarks_roi = None
+            forehead_roi_is_adequate = False
+
+            (h_frame, w_frame) = frame.shape[:2]
+            face_detected_this_frame = False
+
+            # Detectăm fața folosind DNN + landmarks dlib
+            if (self.face_detector_type == "dnn" and
+                self.face_net is not None and
+                    self.landmark_predictor is not None):
+                blob = cv2.dnn.blobFromImage(
+                    cv2.resize(frame, dnn_input_size), 1.0, dnn_input_size, (104.0, 177.0, 123.0))
+                self.face_net.setInput(blob)
+                detections = self.face_net.forward()
+
+                best_detection_confidence = 0
+                best_face_box = None
+                for i in range(detections.shape[2]):
+                    confidence = detections[0, 0, i, 2]
+                    if confidence > dnn_confidence_threshold and confidence > best_detection_confidence:
+                        best_detection_confidence = confidence
+                        box = detections[0, 0, i, 3:7] * \
+                            np.array([w_frame, h_frame, w_frame, h_frame])
+                        (startX, startY, endX, endY) = box.astype(int)
+                        startX = max(0, startX)
+                        startY = max(0, startY)
+                        endX = min(w_frame - 1, endX)
+                        endY = min(h_frame - 1, endY)
+                        if startX < endX and startY < endY:
+                            best_face_box = (
+                                startX, startY, endX - startX, endY - startY)
+
+                if best_face_box:
+                    x, y, w, h = best_face_box
+                    self.detected_face = (x, y, w, h)
+                    cv2.rectangle(display_frame, (x, y),
+                                  (x + w, y + h), (0, 255, 0), 2)
+                    face_detected_this_frame = True
+
+                    # Extragem landmarks și ROI frunte
+                    dlib_rect = dlib.rectangle(
+                        int(x), int(y), int(x + w), int(y + h))
+                    landmarks = self.landmark_predictor(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), dlib_rect)
+                    raw_roi = self.get_forehead_roi_from_landmarks(
+                        landmarks, frame.shape)
+
+                    if raw_roi:
+                        fx, fy, fw, fh = raw_roi
+
+                        # Smooth spațial al ROI-ului (exponenațial)
+                        if self.last_forehead_roi is None:
+                            self.last_forehead_roi = raw_roi
+                        else:
+                            lx, ly, lw, lh = self.last_forehead_roi
+                            fx = int(lx + self.roi_smoothing_alpha * (fx - lx))
+                            fy = int(ly + self.roi_smoothing_alpha * (fy - ly))
+                            fw = int(lw + self.roi_smoothing_alpha * (fw - lw))
+                            fh = int(lh + self.roi_smoothing_alpha * (fh - lh))
+                            self.last_forehead_roi = (fx, fy, fw, fh)
+
+                        # Verificăm din nou dimensiunea după smoothing
+                        if fw >= self.min_forehead_roi_w and fh >= self.min_forehead_roi_h:
+                            forehead_roi_is_adequate = True
+                            cv2.rectangle(display_frame, (fx, fy),
+                                          (fx + fw, fy + fh), (255, 100, 100), 2)
+                            current_roi_bgr = frame[fy: fy + fh, fx: fx + fw]
+
+                            # Verificăm varianța intensității pixelilor în canalul verde
+                            roi_green = current_roi_bgr[:, :, 1]
+                            if np.var(roi_green) < 10.0:
+                                # Semnal prea slab (puțină variație), ignorăm
+                                forehead_roi_is_adequate = False
+                            else:
+                                # Redimensionăm pentru EVM/PPG
+                                input_roi_for_processing = cv2.resize(
+                                    current_roi_bgr,
+                                    (self.target_evm_roi_w, self.target_evm_roi_h),
+                                    interpolation=cv2.INTER_AREA
+                                )
+                                if self.evm_enabled:
+                                    self.evm_roi_buffer.append(
+                                        input_roi_for_processing)
+                                    if len(self.evm_roi_buffer) > self.evm_roi_buffer_size:
+                                        self.evm_roi_buffer.pop(0)
+                                    if len(self.evm_roi_buffer) == self.evm_roi_buffer_size:
+                                        magnified_roi = eulerian_magnification(
+                                            self.evm_roi_buffer,
+                                            effective_fps_for_calc,
+                                            self.evm_low_freq_hz,
+                                            self.evm_high_freq_hz,
+                                            self.evm_amplification_factor,
+                                            self.evm_pyramid_levels
+                                        )
+                                        if magnified_roi is not None and magnified_roi.size > 0:
+                                            processed_roi_for_signal_extraction = magnified_roi
+                                            h_m, w_m = magnified_roi.shape[:2]
+                                            # Înserăm vizual magnified ROI în colțul din stânga-sus
+                                            if 5 + h_m <= display_frame.shape[0] and 5 + w_m <= display_frame.shape[1]:
+                                                display_frame[5: 5 + h_m, 5: 5 + w_m] = cv2.resize(
+                                                    magnified_roi, (
+                                                        w_m, h_m), interpolation=cv2.INTER_LINEAR
+                                                )
+                                        else:
+                                            # Dacă EVM a eșuat, luăm ROI simplu
+                                            processed_roi_for_signal_extraction = input_roi_for_processing
+                                else:
+                                    processed_roi_for_signal_extraction = input_roi_for_processing
+                        else:
+                            forehead_roi_is_adequate = False
+                    else:
+                        # Nu s-a putut determina ROI frunte
+                        forehead_roi_is_adequate = False
+
+            # Dacă avem față detectată și un ROI adecvat, procesăm semnalul PPG
+            if face_detected_this_frame and forehead_roi_is_adequate and processed_roi_for_signal_extraction is not None and processed_roi_for_signal_extraction.size > 0:
+                # Extragem valoarea medie a canalului verde (PPG) din ROI
+                ppg_value = np.mean(
+                    processed_roi_for_signal_extraction[:, :, 1])
+                self.ppg_signal_history.append(ppg_value)
+                if len(self.ppg_signal_history) > self.ppg_buffer_size:
+                    self.ppg_signal_history.pop(0)
+
+                # Când avem buffer complet, începe analiza FFT
+                if len(self.ppg_signal_history) == self.ppg_buffer_size:
+                    raw_ppg_signal = np.array(self.ppg_signal_history)
+                    signal = raw_ppg_signal - np.mean(raw_ppg_signal)
+
+                    # Filtrare Butterworth band-pass (doar dacă semnalul e suficient de lung)
+                    if effective_fps_for_calc >= 2.0 * self.max_frequency_hz:
+                        min_len_butter_ppg = 3 * \
+                            (self.ppg_filter_order * 2) + 1
+                        if len(signal) > min_len_butter_ppg:
+                            try:
+                                b, a = butter(
+                                    self.ppg_filter_order,
+                                    [self.min_frequency_hz, self.max_frequency_hz],
+                                    btype='band', fs=effective_fps_for_calc
+                                )
+                                padlen_butter_ppg = min(
+                                    min_len_butter_ppg - 1, len(signal) - 1) if len(signal) > 1 else 0
+                                if len(signal) > padlen_butter_ppg:
+                                    signal = filtfilt(
+                                        b, a, signal, padlen=padlen_butter_ppg)
+                            except ValueError:
+                                pass
+
+                    # Aplicați Savitzky-Golay pentru a netezi vârfurile
+                    s_win = max(5, int(effective_fps_for_calc /
+                                (self.max_frequency_hz * 1.5)) | 1)
+                    s_win = min(s_win, len(signal) - 2 if len(signal) %
+                                2 == 0 else len(signal) - 1)
+                    s_win = max(5, s_win | 1)
+
+                    if len(signal) > s_win and s_win > 0:
+                        try:
+                            signal = savgol_filter(
+                                signal, s_win, self.savgol_polyorder_ppg)
+                        except ValueError:
+                            pass
+
+                    current_pulse_bpm = None
+                    sqi = 0.0  # Signal Quality Index (0–1)
+
+                    # Doar dacă semnalul este suficient de lung, aplicăm FFT
+                    if len(signal) >= self.min_fft_len:
+                        windowed = signal * np.hanning(len(signal))
+                        fft_result = fft(windowed)
+                        fft_magnitudes = np.abs(
+                            fft_result[:len(fft_result)//2])
+                        fft_frequencies_hz = fftfreq(
+                            len(windowed), d=1.0 / effective_fps_for_calc)[:len(windowed)//2]
+
+                        # Filtrăm doar frecvențele de interes
+                        valid_mask = (fft_frequencies_hz >= self.min_frequency_hz) & (
+                            fft_frequencies_hz <= self.max_frequency_hz)
+                        mags_valid = fft_magnitudes[valid_mask]
+                        freqs_valid = fft_frequencies_hz[valid_mask]
+
+                        if mags_valid.size > 0:
+                            # SQI ≈ raportul dintre puterea din banda de interes și puterea totală
+                            total_power = np.sum(fft_magnitudes**2)
+                            band_power = np.sum(mags_valid**2)
+                            if total_power > 0:
+                                sqi = band_power / total_power
+
+                            # Alegem vârful cel mai promițător
+                            min_prom = 0.15 * \
+                                (np.max(mags_valid) - np.min(mags_valid)
+                                 ) if mags_valid.ptp() > 0 else 0.05
+                            min_prom = max(
+                                min_prom, 0.1 * np.max(fft_magnitudes) if np.max(fft_magnitudes) > 0 else 0.1)
+                            distance = int(
+                                (8.0/60.0) / (effective_fps_for_calc / len(windowed)))
+                            distance = max(1, distance)
+
+                            peaks_indices, _ = find_peaks(
+                                mags_valid, prominence=min_prom, distance=distance)
+                            if peaks_indices.size > 0:
+                                best_peak = peaks_indices[np.argmax(
+                                    mags_valid[peaks_indices])]
+                                dom_freq = freqs_valid[best_peak]
+                                current_pulse_bpm = dom_freq * 60
+
+                    # Dacă avem un puls calculat și SQI decent (> 0.5), îl adăugăm în lista de valori
+                    if current_pulse_bpm is not None and sqi > 0.5:
+                        self.pulse_values.append(current_pulse_bpm)
+                        self.time_values.append(
+                            time.time() - self.measurement_time)
+
+                        # Afișăm în timp real starea "Calc..." dar doar dacă nu am atins stabilitatea
+                        self.root.after(0, lambda p=current_pulse_bpm: self.pulse_label.config(
+                            text=f"Puls: {p:.1f} BPM (Calc...)"))
+                        self.root.after(
+                            0, lambda p=current_pulse_bpm: self.update_pulse_status(p))
+
+                        # Când avem destule valori, verificăm stabilitatea
+                        if len(self.pulse_values) >= self.stability_check_min_pulses:
+                            last_window = np.array(
+                                self.pulse_values[-self.stability_check_min_pulses:])
+                            std_val = np.std(last_window)
+                            mean_val = np.mean(last_window)
+                            # Dacă media e în interval și deviația sub prag, e stabil
+                            if (self.target_pulse_min_freq_bpm <= mean_val <= self.target_pulse_max_freq_bpm + 10
+                                    and std_val < self.stability_std_threshold):
+                                self.stable_pulse = mean_val
+                                # Afișăm pulsul stabil
+                                self.root.after(0, lambda sp=self.stable_pulse: self.pulse_label.config(
+                                    text=f"Puls: {sp:.1f} BPM (Stabil)"))
+                                self.root.after(
+                                    0, lambda sp=self.stable_pulse: self.update_pulse_status(sp, final=True))
+                                self.root.after(
+                                    0, lambda: self.save_button.config(state=tk.NORMAL))
+                                self.root.after(
+                                    0, lambda: self.feedback_button.config(state=tk.NORMAL))
+                                self.root.after(
+                                    0, lambda: self.graph_button.config(state=tk.NORMAL))
+                                self.root.after(0, lambda: self.instruction_label.config(
+                                    text="Măsurare finalizată."))
+                                # Oprim procesarea continuă
+                                self.root.after(0, self.stop_measurement)
+                                break
+                    else:
+                        # Semnal necalitativ sau nu s-a calculat, afișăm mesaj de procesare continuă
+                        self.root.after(0, lambda: self.pulse_label.config(
+                            text="Puls: Căutare vârf..."))
+                        self.root.after(0, lambda: self.pulse_status_label.config(
+                            text="Stare: Procesare..."))
+                else:
+                    # Buffer incomplet, afișăm progres colectare date
+                    progress_ppg = (
+                        len(self.ppg_signal_history) / self.ppg_buffer_size) * 100
+                    self.root.after(0, lambda p=progress_ppg: self.instruction_label.config(
+                        text=f"Umplere buffer PPG: {p:.0f}%"))
+                    self.root.after(0, lambda: self.pulse_status_label.config(
+                        text="Stare: Colectare date..."))
+
+            elif face_detected_this_frame and not forehead_roi_is_adequate:
+                # Față detectată, dar ROI frunte insuficient sau varianță prea mică
+                self.root.after(0, lambda: self.instruction_label.config(
+                    text="ROI frunte inadecvat. Ajustați poziția/lumina."))
+                self.root.after(
+                    0, lambda: self.pulse_label.config(text="Puls: N/A"))
+                self.root.after(0, lambda: self.pulse_status_label.config(
+                    text="Stare: ROI inadecvat"))
+            else:
+                # Fără față în cadru
+                self.root.after(0, lambda: self.instruction_label.config(
+                    text="Nicio față detectată. Așezați fața în cadru."))
+                self.root.after(
+                    0, lambda: self.pulse_label.config(text="Puls: N/A"))
+                self.root.after(0, lambda: self.pulse_status_label.config(
+                    text="Stare: Fără față"))
+
+            # Afișăm frame-ul procesat
+            rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            self.photo = self.convert_cv2_to_photo(rgb_frame)
+            self.root.after(0, self.update_canvas_image)
+
+            elapsed_time = time.time() - loop_start_time
+            target_frame_time = 1.0 / 30.0
+            if elapsed_time < target_frame_time:
+                time.sleep(target_frame_time - elapsed_time)
+
+        # Când ieșim din buclă, eliberăm camera
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+            self.cap = None
+
+    # -------------------------------------------------
+    # Actualizare imagine pe Canvas
+    # -------------------------------------------------
+    def update_canvas_image(self):
+        try:
+            if self.photo and self.canvas and self.canvas.winfo_exists():
+                self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+        except tk.TclError:
+            pass
+        except Exception:
+            pass
+
+    # -------------------------------------------------
+    # Convertire frame OpenCV în PhotoImage Tkinter
+    # -------------------------------------------------
+    def convert_cv2_to_photo(self, frame_cv2):
+        if frame_cv2 is None:
+            return None
+        if frame_cv2.dtype != np.uint8:
+            frame_cv2 = frame_cv2.astype(np.uint8)
+        if len(frame_cv2.shape) == 2:
+            frame_cv2 = cv2.cvtColor(frame_cv2, cv2.COLOR_GRAY2RGB)
+        elif frame_cv2.shape[2] == 4:
+            frame_cv2 = cv2.cvtColor(frame_cv2, cv2.COLOR_RGBA2RGB)
+
+        h, w, _ = frame_cv2.shape
+        if self.canvas and self.canvas.winfo_exists():
+            if w != self.canvas.winfo_width() or h != self.canvas.winfo_height():
+                if self.canvas.winfo_width() > 0 and self.canvas.winfo_height() > 0:
+                    frame_cv2 = cv2.resize(
+                        frame_cv2,
+                        (self.canvas.winfo_width(), self.canvas.winfo_height()),
+                        interpolation=cv2.INTER_AREA
+                    )
+        img = Image.fromarray(frame_cv2)
+        return ImageTk.PhotoImage(image=img)
+
+    # -------------------------------------------------
+    # Afișare starea pulsului (culoare & text)
+    # -------------------------------------------------
+    def update_pulse_status(self, pulse_bpm, final=False):
+        if final:
+            if pulse_bpm > 100:
+                status_text = "Stare: Puls Ridicat (după efort?)"
+                color = "red"
+            elif 60 <= pulse_bpm <= 100:
+                status_text = "Stare: Puls Normal"
+                color = "green"
+            else:
+                status_text = "Stare: Puls Scăzut"
+                color = "blue"
+        else:
+            if pulse_bpm > 100:
+                status_text = "Stare: Pulsul pare ridicat..."
+                color = "orange"
+            elif 60 <= pulse_bpm <= 100:
+                status_text = "Stare: Puls în limite normale..."
+                color = "grey"
+            else:
+                status_text = "Stare: Pulsul pare scăzut..."
+                color = "blue"
+
+        self.pulse_status_label.config(text=status_text, foreground=color)
+
+    # -------------------------------------------------
+    # Salvarea valorii pulsului într-un fișier text
+    # -------------------------------------------------
+    def save_pulse(self):
+        if self.stable_pulse is not None:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open("istoric_puls.txt", "a") as f:
+                    f.write(
+                        f"Puls: {self.stable_pulse:.2f} BPM, Data: {timestamp}\n")
+                messagebox.showinfo(
+                    "Salvat", "Ritmul cardiac a fost salvat cu succes!")
+            except IOError:
+                messagebox.showerror(
+                    "Eroare Salvare", "Nu s-a putut scrie în fișierul istoric_puls.txt.")
+        else:
+            messagebox.showwarning(
+                "Atenție", "Nu există o valoare stabilă a pulsului de salvat.")
+
+    # -------------------------------------------------
+    # Fereastra de Feedback (recomandări medicale)
+    # -------------------------------------------------
+    def show_feedback(self):
+        if self.stable_pulse is not None:
+            pulse_val = self.stable_pulse
+        elif self.pulse_values:
+            pulse_val = self.pulse_values[-1]
+        else:
+            messagebox.showinfo("Feedback Măsurare",
+                                "Nu există date de puls disponibile.")
+            return
+
+        if pulse_val < 40:
+            title = "Bradicardie marcată (puls < 40 BPM)"
+            rec = (
+                "Un puls sub 40 BPM indică bradicardie marcată.\n"
+                "Simptome: amețeli severe, leșin, angină, confuzie mentală.\n"
+                "Recomandare imediată: măsurați tensiunea arterială; dacă este foarte scăzută, solicitați urgență.\n"
+                "ECG și ecocardiografie urgentă pentru bloc AV complet.\n"
+                "Verificați medicația care poate scădea excesiv ritmul (beta‐blocante, digoxin).\n"
+                "Monitorizare continuă în spital cu Holter 24-ore.\n"
+                "Corectați dezechilibrele electrolitice (hiperkaliemie).\n"
+                "Evitați efortul fizic intens până la tratarea bradicardiei.\n"
+                "Pacemaker indicat dacă apare bloc AV complet.\n"
+                "Riscul de sincopă și leziune cerebrală este ridicat fără tratament prompt."
+            )
+        elif 40 <= pulse_val < 60:
+            title = "Bradicardie ușoară (40–60 BPM)"
+            rec = (
+                "Interval de puls 40–60 BPM poate apărea la sportivi antrenați sau ca tulburare sinoatrială.\n"
+                "Simptome posibile: oboseală neobișnuită, amețeli ocazionale.\n"
+                "Recomandare: monitorizați pulsul în mod regulat și notați orice episoade de amețeli.\n"
+                "Evitați suprasolicitarea fizică intensă fără consult cardiologic.\n"
+                "Hidratați-vă și mențineți aportul de electroliți (potasiu, magneziu).\n"
+                "Verificați medicamentele care pot scădea ritmul cardiac (beta‐blocante, digoxin).\n"
+                "Dacă apar amețeli frecvente sau sincopă, consultați cardiologul imediat.\n"
+                "Chiar și la sportivi, puls < 50 BPM persistent necesită ECG și test de efort.\n"
+                "Mențineți un stil de viață echilibrat, somn regulat și evitați stresul sever.\n"
+                "Evaluare anuală cu ECG de rutină recomandată."
+            )
+        elif 60 <= pulse_val <= 100:
+            title = "Ritm normal (60–100 BPM)"
+            rec = (
+                "Interval de puls normal în repaus; nu necesită intervenție specială.\n"
+                "Continuați activitatea fizică moderată și mențineți o greutate sănătoasă.\n"
+                "Monitorizați periodic tensiunea arterială și nivelul de stres.\n"
+                "Hidratați-vă și dormiți regulat pentru un ritm cardiac stabil.\n"
+                "Evitați consumul excesiv de cofeină, alcool sau alți stimulenți.\n"
+                "Control cardiologic anual cu EKG și, dacă este cazul, ecocardiografie.\n"
+                "Antrenamente aerobice regulate ajută la menținerea pulsului la limita inferioară.\n"
+                "Mențineți o dietă echilibrată, bogată în fructe, legume și omega-3.\n"
+                "Notarea ocazională a pulsului după efort intens pentru a urmări revenirea la normal.\n"
+                "Relaxare activă și gestionare a stresului pentru sănătatea cardiovasculară."
+            )
+        else:
+            title = "Tahicardie (puls > 100 BPM)"
+            rec = (
+                "Puls peste 100 BPM în repaus indică tahicardie sinusală sau alte forme.\n"
+                "Simptome: palpitații, tremur, transpirație excesivă.\n"
+                "Recomandare: măsurați pulsul după 5 minute de repaus; dacă rămâne >100 BPM, consultați medic.\n"
+                "Evitați cofeina, nicotina și decongestionantele ce pot crește ritmul.\n"
+                "Gestionați anxietatea și stresul prin tehnici de relaxare (respirație, meditație).\n"
+                "Hidratați-vă; deshidratarea poate agrava tahicardia.\n"
+                "Consultați medic pentru analize: hemogramă, funcție tiroidiană, electroliți.\n"
+                "ECG, ecocardiografie și Holter 24 ore pentru identificarea cauzei.\n"
+                "Dacă apare durere toracică, dificultate respiratorie sau leșin, solicitați Urgență.\n"
+                "Dacă este cauzată de anemie sau hipertiroidie, tratați condiția subiacentă."
+            )
+
+        feedback_win = tk.Toplevel(self.root)
+        feedback_win.title("Feedback Măsurare - Recomandări Medicale")
+        feedback_win.geometry("600x600")
+        feedback_win.resizable(False, False)
+
+        # Fundal uniform în fereastra de feedback
+        feedback_win.configure(bg=BG_COLOR)
+
+        lbl_title = ttk.Label(
+            feedback_win, text=title, font=("Arial", 16, "bold"),
+            background=BG_COLOR, foreground="#333333"
+        )
+        lbl_title.place(x=300, y=30, anchor="n")
+
+        text_widget = tk.Text(
+            feedback_win, wrap=tk.WORD, font=("Arial", 12), height=20,
+            bg=BG_COLOR, bd=0, highlightthickness=0, fg="#333333"
+        )
+        text_widget.insert(tk.END, rec.strip())
+        text_widget.config(state=tk.DISABLED)
+        # Am modificat y pentru a urca textul mai sus
+        text_widget.place(x=300, y=80, anchor="n", width=560, height=420)
+
+        save_pdf_btn = ttk.Button(
+            feedback_win, text="Salvează acest feedback ca PDF", style="My.TButton",
+            command=lambda t=title, r=rec: self.save_feedback_pdf(t, r)
+        )
+        save_pdf_btn.place(x=300, y=540, anchor="n", width=300, height=40)
+
+    # -------------------------------------------------
+    # Salvarea recomandărilor medicale în PDF
+    # -------------------------------------------------
+    def save_feedback_pdf(self, title, rec):
+        replacements = {
+            'ă': 'a', 'Ă': 'A', 'â': 'a', 'Â': 'A',
+            'ș': 's', 'Ș': 'S', 'ț': 't', 'Ț': 'T',
+            'î': 'i', 'Î': 'I', '–': '-', '“': '"', '”': '"', '’': "'"
+        }
+        title_ascii = ''.join(replacements.get(ch, ch) for ch in title)
+        rec_ascii = ''.join(replacements.get(ch, ch) for ch in rec)
+
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 14)
+        pdf.multi_cell(0, 10, title_ascii)
+        pdf.ln(5)
+        pdf.set_font("Arial", size=12)
+        pdf.multi_cell(0, 8, rec_ascii)
+
+        filename = f"feedback_{int(time.time())}.pdf"
+        try:
+            pdf.output(filename)
+            messagebox.showinfo(
+                "PDF Salvat", f"Feedback salvat ca {filename} în folderul proiectului.")
+        except Exception as e:
+            messagebox.showerror("Eroare Salvare PDF",
+                                 f"Nu s-a putut salva PDF-ul. Eroare: {e}")
+
+    # -------------------------------------------------
+    # Fereastra Grafic Evoluție Puls
+    # -------------------------------------------------
+    def show_graph(self):
+        if not self.pulse_values or not self.time_values:
+            messagebox.showwarning(
+                "Atenție", "Nu există date disponibile pentru a genera graficul.")
+            return
+
+        if self.graph_window is None or not tk.Toplevel.winfo_exists(self.graph_window):
+            self.graph_window = tk.Toplevel(self.root)
+            self.graph_window.title("Evoluția Pulsului")
+            self.graph_window.geometry("800x450")
+            self.graph_window.resizable(False, False)
+
+            # Fundal uniform în fereastra grafic
+            self.graph_window.configure(bg=BG_COLOR)
+
+            graph_frame = tk.Frame(
+                self.graph_window, bg=BG_COLOR, bd=0, highlightthickness=0)
+            graph_frame.place(x=10, y=10, width=780, height=380)
+
+            self.fig.clf()
+            self.ax = self.fig.add_subplot(111)
+
+            self.canvas_widget = FigureCanvasTkAgg(
+                self.fig, master=graph_frame)
+            self.canvas_widget.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+            save_graph_button = ttk.Button(
+                self.graph_window, text="Salvează Grafic", style="My.TButton", command=self.save_graph
+            )
+            save_graph_button.place(
+                x=400, y=400, anchor="n", width=200, height=40)
+
+            def close_graph_window():
+                self.graph_window.destroy()
+                self.graph_window = None
+            self.graph_window.protocol("WM_DELETE_WINDOW", close_graph_window)
+
+        self.ax.clear()
+        self.ax.plot(self.time_values, self.pulse_values, marker='o',
+                     linestyle='-', color='brown', markersize=4)
+        if self.stable_pulse:
+            self.ax.axhline(y=self.stable_pulse, color='gold', linestyle='--',
+                            label=f'Puls Stabil: {self.stable_pulse:.2f} BPM')
+            self.ax.legend()
+        self.ax.set_xlabel("Timp (s)")
+        self.ax.set_ylabel("Puls (BPM)")
+        self.ax.set_title("Evoluția Pulsului în Timp")
+        self.ax.grid(True)
+        self.canvas_widget.draw()
+        self.graph_window.lift()
+
+    # -------------------------------------------------
+    # Salvarea graficului în PNG
+    # -------------------------------------------------
+    def save_graph(self):
+        if self.graph_window is not None and self.fig:
+            try:
+                filename = f"grafic_puls_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                self.fig.savefig(filename)
+                messagebox.showinfo(
+                    "Grafic Salvat", f"Graficul a fost salvat ca '{filename}'")
+            except Exception as e:
+                messagebox.showerror(
+                    "Eroare Salvare Grafic", f"Nu s-a putut salva graficul: {e}")
+        else:
+            messagebox.showwarning(
+                "Atenție", "Nu există un grafic de salvat sau figura nu este disponibilă.")
+
+    # -------------------------------------------------
+    # Punctul de intrare în bucla principală
+    # -------------------------------------------------
+    def run(self):
+        self.root.mainloop()
+        if self.is_measuring:
+            self.stop_measurement()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = PulseMonitorApp(root)
+    app.run()

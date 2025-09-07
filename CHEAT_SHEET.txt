@@ -1,0 +1,30 @@
+
+========================
+MONITOR PULS + RESPIRAȚIE - V10 (CHEAT SHEET)
+========================
+
+1. **START/STOP MĂSURARE**
+   - Apasă "Start Măsurare" pentru a porni analiza.
+   - Aplicația oprește măsurarea automat când pulsul devine stabil (ca un pulsoximetru) sau la 30 secunde.
+
+2. **PULS & RESPIRAȚIE**
+   - Pulsul este detectat din frunte (ROI albastru).
+   - Dacă ești în efort, aplicația calculează și **ritmul respirator (RPM)**.
+
+3. **ALGORITMI**
+   - Corecție automată a luminozității (gamma).
+   - Filtrare Savitzky-Golay + Butterworth.
+   - Analiză FFT pentru puls și respirație.
+
+4. **SALVARE DATE**
+   - "Salvează Ritmul" - salvează pulsul și respirația finală în `istoric_puls.txt`.
+   - "Export Excel" - fiecare export generează un fișier separat `raport_puls_YYYY-MM-DD_HH-MM-SS.xlsx`.
+
+5. **GRAFIC**
+   - "Grafic Puls" - afișează variația pulsului în timp.
+
+6. **REQUISITE**
+   - Python 3.10+
+   - Module: opencv-python, numpy, pillow, scipy, matplotlib, openpyxl
+
+========================

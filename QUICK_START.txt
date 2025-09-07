@@ -1,0 +1,17 @@
+
+QUICK START - MONITOR PULS + RESPIRAȚIE V10
+
+1. Instalează Python 3.10+ și modulele necesare:
+   pip install opencv-python numpy pillow scipy matplotlib openpyxl
+
+2. Rulează aplicația:
+   python pulse_breath_monitor_v10.py
+
+3. Apasă "Start Măsurare".
+   - Măsurarea se oprește automat când pulsul este stabil sau la 30 secunde.
+   - Dacă ești în efort, vei vedea și respirația (RPM).
+
+4. Poți salva datele și exporta în Excel (fișiere noi pentru fiecare export).
+
+5. Pentru build executabil:
+   Rulează build_v10.bat
